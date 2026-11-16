@@ -1,1 +1,1 @@
-{"name":"markdown-render-speed-02","private":true,"type":"module","version":"1.0.0"}
+{"description":"Index-scanner Markdown renderer, byte-identical HTML to marked 18.1.3. Dependency-free, Node stdlib only.","name":"markdown-render-speed-02","private":true,"type":"module","version":"2.0.0"}
