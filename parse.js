@@ -187,8 +187,17 @@ function memoIndent(fn) {
 }
 const BLOCK_TAG =
   'address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|meta|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul';
-const listItemRegex = (bull) =>
-  new RegExp(`^( {0,3}${bull})((?:[\t ][^\n]*)?(?:\n|$))`);
+// The list-item regex, prebuilt for the five possible bullets instead of
+// compiled fresh for every list: `*`, `+`, `-`, and ordered `1.` / `1)`.
+// (DeepSeek suggestion A: hoist per-call regex compilations to module
+// level. The memoIndent builders below are already cached the same way.)
+const ITEM_RE = {
+  '*': /^( {0,3}\*)((?:[\t ][^\n]*)?(?:\n|$))/,
+  '+': /^( {0,3}\+)((?:[\t ][^\n]*)?(?:\n|$))/,
+  '-': /^( {0,3}\-)((?:[\t ][^\n]*)?(?:\n|$))/,
+  '.': /^( {0,3}\d{1,9}\.)((?:[\t ][^\n]*)?(?:\n|$))/,
+  ')': /^( {0,3}\d{1,9}\))((?:[\t ][^\n]*)?(?:\n|$))/,
+};
 const nextBulletRegex = memoIndent(
   (a) =>
     new RegExp(`^ {0,${a}}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))`),
@@ -304,10 +313,25 @@ function unescape(s) {
     },
   );
 }
+// True when `s` ends with a double blank line: a newline, optional
+// spaces/tabs, another newline, optional trailing spaces/tabs. (The same
+// answer `/\n[ \t]*\n[ \t]*$/.test(s)` gives, without a regex scan over
+// the whole item text on every list item.)
+function endsDoubleBlank(s) {
+  let i = s.length;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
+  if (i === 0 || s[i - 1] !== '\n') return false;
+  i--;
+  while (i > 0 && (s[i - 1] === ' ' || s[i - 1] === '\t')) i--;
+  return i > 0 && s[i - 1] === '\n';
+}
 // Sanitize a URL for href/src: encodeURI, keeping % as %, else null.
 // (marked does not block javascript:/data: schemes; neither do we.)
 function cleanUrl(a) {
   try {
+    // encodeURI only produces %25 from a literal % in the input, so when
+    // the input has no % the undo-replace below is a no-op: skip its scan.
+    if (!a.includes('%')) return encodeURI(a);
     return encodeURI(a).replace(GR.percentDecode, '%');
   } catch {
     return null;
@@ -388,6 +412,23 @@ function expandTabs(a, offset = 0) {
   }
   return out;
 }
+// Number of Unicode code points in `s` (the same number
+// `[...s].length` gives, without allocating the array). Used on short
+// delimiter runs, where the spread was a per-attempt allocation.
+function cpLen(s) {
+  let n = 0;
+  for (const _ch of s) n++;
+  return n;
+}
+// The last code point of `s` as a string (the same string
+// `[...s].at(-1) ?? ''` gives, without allocating the array). A trailing
+// low surrogate belongs to the code point before it.
+function lastCodePoint(s) {
+  if (s.length === 0) return '';
+  const c = s.charCodeAt(s.length - 1);
+  if (c >= 0xdc00 && c <= 0xdfff && s.length > 1) return s.slice(-2);
+  return s.slice(-1);
+}
 // Fenced code: remove the fence indent from each line of the content.
 function indentCodeComp(fence, code) {
   const m = fence.match(GR.indentCodeCompensation);
@@ -402,6 +443,56 @@ function indentCodeComp(fence, code) {
       return line.slice(Math.min(spaces.length, indent.length));
     })
     .join('\n');
+}
+// The first line of `s` (the same string `s.split('\n', 1)[0]` gives,
+// without allocating the split array).
+function firstLineOf(s) {
+  const nl = s.indexOf('\n');
+  return nl === -1 ? s : s.slice(0, nl);
+}
+// Index of the first character of `s` that is not a space, or -1 when the
+// string is all spaces (the same answer `s.search(/[^ ]/)` gives, without
+// a regex exec per call).
+function firstNonSpace(s) {
+  for (let i = 0; i < s.length; i++) if (s[i] !== ' ') return i;
+  return -1;
+}
+// Column of the first character of `s` that is not a space or a tab (a tab
+// counts as 4 columns, the way `s.replace(/\t/g, '    ')` counts it), or
+// -1 when the string is all spaces and tabs. (The same answer
+// `s.replace(/\t/g, '    ').search(/[^ ]/)` gives, without the replace and
+// the regex exec.)
+function firstNonSpaceCol(s) {
+  let col = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === ' ') col++;
+    else if (c === '\t') col += 4;
+    else return col;
+  }
+  return -1;
+}
+// Expand the leading spaces/tabs of `line` the way marked does: a tab goes
+// to the next 4-column stop starting at column `offset`, a space counts 1.
+// (The same string `line.replace(/^[ \t]+/, v => expandTabs(v, offset))`
+// gives, without a regex exec and a callback per line.)
+function expandLeading(line, offset = 0) {
+  let i = 0;
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) i++;
+  if (i === 0) return line;
+  let col = offset;
+  let out = '';
+  for (let j = 0; j < i; j++) {
+    if (line[j] === '\t') {
+      const pad = 4 - (col % 4);
+      out += '    '.slice(0, pad);
+      col += pad;
+    } else {
+      out += ' ';
+      col++;
+    }
+  }
+  return out + line.slice(i);
 }
 
 
@@ -434,7 +525,22 @@ function scanDelims(src) {
 // The masked source used while scanning for emphasis closers: link texts
 // and code spans are blanked out (length preserved) so their * _ ~ cannot
 // close an emphasis span that starts outside them.
+//
+// Fast path: the three replaces below can only change a string that
+// contains a link bracket, a backtick, a backslash escape, or a tag
+// opener. anyPunctuationOutsideCode needs a backtick or a backslash, and
+// blockSkip needs `[`, a backtick, or `<` (the reflinkSearch part is
+// already guarded by `[`). With none of the four present every replace is
+// the identity, so return the string untouched instead of running two
+// full-source regex scans over a plain emphasis paragraph.
 function blankLinksAndCode(state, src) {
+  if (
+    !src.includes('[') &&
+    !src.includes('`') &&
+    !src.includes('\\') &&
+    !src.includes('<')
+  )
+    return src;
   let t = src;
   if (state.links && src.includes('[')) {
     const re = GR.reflinkSearch;
@@ -452,19 +558,30 @@ function blankLinksAndCode(state, src) {
     };
     t = t.replace(re, replaceRef);
   }
-  t = t.replace(GR.anyPunctuationOutsideCode, (whole, codeSpan, escPunct) =>
-    escPunct
-      ? '+'.repeat(whole.length)
-      : codeSpan
-        ? codeSpan +
-          whole.slice(codeSpan.length, -codeSpan.length).replace(/`/g, '+') +
-          codeSpan
-        : whole,
-  );
-  t = t.replace(GR.blockSkip, (whole, _g1, codeSpan) => {
-    const o = codeSpan ? codeSpan.length : 0;
-    return whole.slice(0, o) + '[' + 'a'.repeat(whole.length - o - 2) + ']';
-  });
+  // Each masking replace runs only when its trigger characters are present
+  // in the string it operates on: anyPunctuationOutsideCode needs a
+  // backtick or a backslash, blockSkip needs `[`, a backtick, or `<`.
+  // Otherwise the replace is the identity, so skip the full-source scan
+  // for it (a paragraph with emphasis and a link but no code span or
+  // escape skips the first replace; one with emphasis and an escape but
+  // no link, code span, or tag skips the second).
+  if (t.includes('`') || t.includes('\\')) {
+    t = t.replace(GR.anyPunctuationOutsideCode, (whole, codeSpan, escPunct) =>
+      escPunct
+        ? '+'.repeat(whole.length)
+        : codeSpan
+          ? codeSpan +
+            whole.slice(codeSpan.length, -codeSpan.length).replace(/`/g, '+') +
+            codeSpan
+          : whole,
+    );
+  }
+  if (t.includes('[') || t.includes('`') || t.includes('<')) {
+    t = t.replace(GR.blockSkip, (whole, _g1, codeSpan) => {
+      const o = codeSpan ? codeSpan.length : 0;
+      return whole.slice(0, o) + '[' + 'a'.repeat(whole.length - o - 2) + ']';
+    });
+  }
   return t;
 }
 // True when `text` contains a link (a [...] that the link regex accepts and
@@ -502,15 +619,14 @@ function linkTextHasTagOrCode(src, text, offset) {
       continue;
     }
     if (text[i] === '`') {
-      const m = GR.inlineCode.exec(text.slice(i));
+      const m = at(S.inlineCode, text, i);
       if (m) {
         i += m[0].length - 1;
         continue;
       }
     }
     if (text[i] !== '<') continue;
-    const rest = src.slice(offset + i);
-    const tag = GR.tag.exec(rest) || GR.autolink.exec(rest);
+    const tag = at(S.tag, src, offset + i) || at(S.autolink, src, offset + i);
     if (tag) {
       if (tag[0].length > text.length - i) return true;
       i += tag[0].length - 1;
@@ -823,7 +939,7 @@ function hEmStrong(st, src, pos, masked, prevChar, out, plain) {
   const i = pos;
   let l = i;
   for (; l > 0 && masked[l - 1] === r; ) l--;
-  const p = [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
+  const p = lastCodePoint(masked.slice(Math.max(0, l - 2), l));
   const h = p === '*' || p === '_' || !!GR.punctuation.exec(p);
   let n = prevChar;
   if (l < i) n = p;
@@ -831,7 +947,7 @@ function hEmStrong(st, src, pos, masked, prevChar, out, plain) {
   if (m[4] && n.match(GR.unicodeAlphaNumeric)) return 0;
   const d = m[1] || m[3] || '';
   if (!d || !n || u) {
-    const k = [...m[0]].length - 1;
+    const k = cpLen(m[0]) - 1;
     let mm = k;
     let f = 0;
     const y = i - l + k;
@@ -852,7 +968,7 @@ function hEmStrong(st, src, pos, masked, prevChar, out, plain) {
     while ((s2 = A.exec(sliced)) !== null && !(s2.index > ee)) {
       const g = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
       if (!g) continue;
-      const b = [...g].length;
+      const b = cpLen(g);
       if (s2[3] || s2[4]) {
         mm += b;
         continue;
@@ -866,7 +982,7 @@ function hEmStrong(st, src, pos, masked, prevChar, out, plain) {
       mm -= b;
       if (mm > 0) continue;
       const bb = Math.min(b, b + mm + f);
-      const te = [...s2[0]][0].length;
+      const te = s2[0].codePointAt(0) > 0xffff ? 2 : 1;
       const M = src.slice(pos, pos + k + s2.index + te + bb);
       const inner = [];
       if (Math.min(k, bb) % 2) {
@@ -890,7 +1006,7 @@ function hDel(st, src, pos, masked, prevChar, out, plain) {
   const m = at(S.delLDelim, src, pos);
   if (!m) return 0;
   if (!(m[1] || '') || !prevChar || GR.punctuation.exec(prevChar)) {
-    const o = [...m[0]].length - 1;
+    const o = cpLen(m[0]) - 1;
     let p = o;
     const h = GR.delRDelim;
     const top = st.maskStack[st.maskStack.length - 1];
@@ -907,7 +1023,7 @@ function hDel(st, src, pos, masked, prevChar, out, plain) {
     while ((s2 = h.exec(sliced)) !== null && !(s2.index > k)) {
       const g = s2[1] || s2[2] || s2[3] || s2[4] || s2[5] || s2[6];
       if (!g) continue;
-      let l = [...g].length;
+      let l = cpLen(g);
       if (l !== o) continue;
       if (s2[3] || s2[4]) {
         p += l;
@@ -916,7 +1032,7 @@ function hDel(st, src, pos, masked, prevChar, out, plain) {
       p -= l;
       if (p > 0) continue;
       l = Math.min(l, l + p);
-      const te = [...s2[0]][0].length;
+      const te = s2[0].codePointAt(0) > 0xffff ? 2 : 1;
       const rawSpan = src.slice(pos, pos + o + s2.index + te + l);
       const inner = [];
       renderInline(st, rawSpan.slice(o, -o), plain, inner);
@@ -1278,6 +1394,44 @@ function lexBlockquote(st, raw0) {
   return { type: 'blockquote', raw, tokens, text };
 }
 
+// True when any of the block-interrupt grammars in `re` can match `line`.
+// Every one of them is anchored `^ {0,a}...` with `a` the clamped indent
+// level, so the first non-space character decides which of them can
+// possibly match: a line whose first non-space character is anything else
+// — or sits past `a` spaces, or is a tab — matches none of them. This
+// turns up to six regex execs per list-item line into a short scan plus at
+// most two. `re` holds whichever of fences/heading/html/quote/nextBullet/
+// hr the caller needs; an absent one is simply never matched. (All six
+// regexes are flagless, so .test() is pure and the order of the original
+// || chain does not matter.)
+function lineInterrupts(line, a, re) {
+  let sp = 0;
+  while (sp < line.length && line[sp] === ' ') sp++;
+  if (sp > a || sp >= line.length) return false;
+  const c = line[sp];
+  switch (c) {
+    case '`':
+    case '~':
+      return !!re.fences && re.fences.test(line);
+    case '#':
+      return !!re.heading && re.heading.test(line);
+    case '<':
+      return !!re.html && re.html.test(line);
+    case '>':
+      return !!re.quote && re.quote.test(line);
+    case '*':
+      return (!!re.nextBullet && re.nextBullet.test(line)) || (!!re.hr && re.hr.test(line));
+    case '+':
+      return !!re.nextBullet && re.nextBullet.test(line);
+    case '-':
+      return (!!re.nextBullet && re.nextBullet.test(line)) || (!!re.hr && re.hr.test(line));
+    case '_':
+      return !!re.hr && re.hr.test(line);
+    default:
+      return !!re.nextBullet && c >= '0' && c <= '9' && re.nextBullet.test(line);
+  }
+}
+
 // List. A literal port of marked's Tokenizer#list, working on the remaining
 // source string (as marked does). Returns the list token, or null.
 function lexList(st, input) {
@@ -1296,8 +1450,7 @@ function lexList(st, input) {
     loose: false,
     items: [],
   };
-  let bull = ordered ? `\\d{1,9}\\${marker.slice(-1)}` : `\\${marker}`;
-  const itemRe = listItemRegex(bull);
+  const itemRe = ITEM_RE[ordered ? marker.slice(-1) : marker];
   let sawDoubleBlank = false;
   for (; e; ) {
     let blankItem = false;
@@ -1306,16 +1459,16 @@ function lexList(st, input) {
     if (!m || GR.hr.test(e)) break;
     const k = consumed();
     e = e.substring(m[0].length);
-    const firstLine = m[2].split('\n', 1)[0];
+    const firstLine = firstLineOf(m[2]);
     const b = m[1].length;
-    let content = firstLine.replace(GR.leadingSpaceTab, (v) => expandTabs(v, b));
-    let nextLine = e.split('\n', 1)[0];
+    let content = expandLeading(firstLine, b);
+    let nextLine = firstLineOf(e);
     let empty = !content.trim();
     let indent = 0;
     if (empty) {
       indent = b + 1;
     } else {
-      indent = content.search(GR.nonSpaceChar);
+      indent = firstNonSpace(content);
       indent = indent > 4 ? 1 : indent;
       itemText = content.slice(indent);
       indent += b;
@@ -1331,31 +1484,26 @@ function lexList(st, input) {
       const headingRe = headingBeginRegex(indent);
       const htmlRe = htmlBeginRegex(indent);
       const quoteRe = blockquoteBeginRegex(indent);
+      // The clamped indent level the six grammars above were built with
+      // (the same clamp memoIndent applies); the dispatch needs it.
+      const a = Math.max(0, Math.min(3, indent - 1));
+      const re6 = { fences: fencesRe, heading: headingRe, html: htmlRe, quote: quoteRe, nextBullet, hr: hrRe };
+      const re4 = { fences: fencesRe, heading: headingRe, html: htmlRe, hr: hrRe };
       for (; e; ) {
-        const line = e.split('\n', 1)[0];
+        const line = firstLineOf(e);
         let expanded;
         nextLine = line;
-        expanded = line.replace(GR.leadingSpaceTab, (v) => expandTabs(v));
-        if (
-          fencesRe.test(line) ||
-          headingRe.test(line) ||
-          htmlRe.test(line) ||
-          quoteRe.test(line) ||
-          nextBullet.test(line) ||
-          hrRe.test(line)
-        ) {
+        expanded = expandLeading(line);
+        if (lineInterrupts(line, a, re6)) {
           break;
         }
-        if (expanded.search(GR.nonSpaceChar) >= indent || !line.trim()) {
+        if (firstNonSpace(expanded) >= indent || !line.trim()) {
           itemText += '\n' + expanded.slice(indent);
         } else {
           if (
             empty ||
-            content.replace(GR.tabCharGlobal, '    ').search(GR.nonSpaceChar) >= 4 ||
-            fencesRe.test(content) ||
-            headingRe.test(content) ||
-            htmlRe.test(content) ||
-            hrRe.test(content)
+            firstNonSpaceCol(content) >= 4 ||
+            lineInterrupts(content, a, re4)
           ) {
             break;
           }
@@ -1373,7 +1521,7 @@ function lexList(st, input) {
     const itemRaw = n.slice(k, consumed());
     if (!list.loose) {
       if (sawDoubleBlank) list.loose = true;
-      else if (GR.doubleBlankLine.test(itemRaw)) sawDoubleBlank = true;
+      else if (endsDoubleBlank(itemRaw)) sawDoubleBlank = true;
     }
     list.items.push({
       type: 'list_item',
@@ -1527,21 +1675,25 @@ function renderBlocks(tokens, out) {
         break;
       }
       case 'blockquote': {
-        const inner = [];
-        renderBlocks(tok.tokens, inner);
-        out.push(`<blockquote>\n${inner.join('')}</blockquote>\n`);
+        // Render straight into the shared output array instead of an
+        // intermediate array that is joined and re-pushed: the final
+        // out.join('') in parse() flattens the parts once, so the
+        // intermediate join only copied the same bytes a second time.
+        out.push('<blockquote>\n');
+        renderBlocks(tok.tokens, out);
+        out.push('</blockquote>\n');
         break;
       }
       case 'list': {
-        let items = '';
-        for (const item of tok.items) {
-          const inner = [];
-          renderBlocks(item.tokens, inner);
-          items += `<li>${inner.join('')}</li>\n`;
-        }
         const tag = tok.ordered ? 'ol' : 'ul';
         const start = tok.ordered && tok.start !== 1 ? ` start="${tok.start}"` : '';
-        out.push(`<${tag}${start}>\n${items}</${tag}>\n`);
+        out.push(`<${tag}${start}>\n`);
+        for (const item of tok.items) {
+          out.push('<li>');
+          renderBlocks(item.tokens, out);
+          out.push('</li>\n');
+        }
+        out.push(`</${tag}>\n`);
         break;
       }
       case 'checkbox':
@@ -1573,7 +1725,13 @@ function renderTableCell(cell) {
 // The entry point: parse one markdown string to marked-identical HTML.
 export function parse(markdown) {
   const st = newParseState();
-  const src = markdown.replace(GR.carriageReturn, '\n');
+  // Fast path: normalizing line endings is a no-op when the input has no
+  // carriage return, so skip the full-string regex replace for it (most
+  // inputs, including every spec example without CRLF).
+  const src =
+    markdown.indexOf('\r') === -1
+      ? markdown
+      : markdown.replace(GR.carriageReturn, '\n');
   const tokens = [];
   lexBlocks(st, src, tokens, false);
   // Inline rendering runs only now: every link reference definition in the
